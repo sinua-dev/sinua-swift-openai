@@ -18,13 +18,14 @@ import SinuaVoice
 /// `OpenAIRealtimeSignaling` (SinuaVoice, unit-tested); this class wires them to a
 /// peer connection. Callbacks arrive on the main thread.
 ///
-/// Order: the credential first (a backend-minted `ek_`, or -- dev only -- a key
-/// that mints one), then the mic permission, then the call. A bad credential
-/// fails before any prompt.
+/// Order: the credential first (a backend-minted `ek_` via the shared
+/// `CredentialSource` contract -- `credentialUrl`, a provider, or one pasted
+/// `ek_`), then the mic permission, then the call. A bad or raw credential fails
+/// before any prompt; a raw API key is always refused.
 ///
 /// Reconnect: a dropped call is replaced by a new session (Realtime has no
 /// resumption), up to 3 attempts with LiveKit's backoff, each with a fresh
-/// credential from `credentialProvider`, then the finalized transcript is
+/// credential from the source, then the finalized transcript is
 /// replayed. Fatal errors (401/403, `invalid_api_key`, …) give up at once.
 ///
 /// **Not exercised at runtime by any test**: a peer connection opens the real
@@ -34,7 +35,9 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
     public static let updateHz = 30.0
     static let connectTimeout: TimeInterval = 20
 
-    private let credentialProvider: () async throws -> String
+    private let credentials: CredentialSource
+    /// A pasted `ek_` is single-session: set once it has been used.
+    private var pastedUsed = false
     private let callsURL: URL
     private let urlSession: URLSession
     private let requestPermission: () async -> Bool
@@ -52,60 +55,99 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
     private var reconnecting = false
     private var timer: DispatchSourceTimer?
     private var metricsCb: ((VoiceMetrics) -> Void)?
+    private var connectionCb: ((Bool) -> Void)?
+    private var sessionUp = false
+    private var micTrack: LKRTCAudioTrack?
+    private var muted = false
 
-    /// Production shape: `credentialProvider` returns a fresh `ek_` from your backend
-    /// (`POST /v1/realtime/client_secrets` there) -- called again on every reconnect.
+    /// The designated init: `credential` is `.url(…)` / `.provider { … }` (a fresh `ek_`
+    /// from your backend on every connect and reconnect), or `.value("ek_…")` for one session.
     public init(
-        credentialProvider: @escaping () async throws -> String,
+        credential: CredentialSource,
         callsURL: URL = OpenAIRealtimeSignaling.callsURL,
         urlSession: URLSession = .shared,
         requestPermission: @escaping () async -> Bool = AVPcmAudioDevice.requestPermission
     ) {
-        self.credentialProvider = credentialProvider
+        credentials = credential
         self.callsURL = callsURL
         self.urlSession = urlSession
         self.requestPermission = requestPermission
     }
 
-    /// `ek_…`: used once (single-session; a drop without a provider ends in `idle`).
-    /// Anything else is a raw API key that mints an `ek_` on the device -- **DEV ONLY**,
-    /// and refused unless `allowInsecureApiKey` is set (`InsecureCredential`).
-    /// This is the only path on iOS that accepts a raw key at all: a custom
-    /// `credentialProvider` is handed straight to the call, never minted from.
+    /// Your backend's endpoint, answering `{ credential: "ek_…", expiresAt? }`.
+    public convenience init(credentialUrl: URL) {
+        self.init(credential: .url(credentialUrl))
+    }
+
+    /// A fresh `ek_` from your code, called again on every reconnect.
     public convenience init(
-        credential: String,
-        model: String = OpenAIRealtimeSignaling.defaultModel,
-        voice: String = OpenAIRealtimeSignaling.defaultVoice,
-        instructions: String? = nil,
-        allowInsecureApiKey: Bool = false
+        credentialProvider: @escaping @Sendable () async throws -> String,
+        callsURL: URL = OpenAIRealtimeSignaling.callsURL,
+        urlSession: URLSession = .shared,
+        requestPermission: @escaping () async -> Bool = AVPcmAudioDevice.requestPermission
     ) {
-        let c = credential.trimmingCharacters(in: .whitespacesAndNewlines)
-        var used = false
-        self.init(credentialProvider: {
-            guard !c.isEmpty else { throw OpenAIRealtimeError.missingCredential }
-            if c.hasPrefix("ek_") {
-                if used { throw OpenAIRealtimeError.credentialSpent }
-                used = true
-                return c
+        self.init(
+            credential: .provider { SinuaCredential(credential: try await credentialProvider()) },
+            callsURL: callsURL, urlSession: urlSession, requestPermission: requestPermission)
+    }
+
+    /// One pasted `ek_…` (single session: a drop without a provider ends in `idle`).
+    public convenience init(credential: String) {
+        self.init(credential: .value(credential))
+    }
+
+    /// The session's model, voice and instructions are fixed when your backend mints
+    /// the `ek_` (`mintOpenAIRealtimeCredential`); these parameters are ignored.
+    @available(*, deprecated, message: "Set model, voice and instructions where your backend mints the ek_.")
+    public convenience init(credential: String, model: String, voice: String? = nil, instructions: String? = nil) {
+        NSLog(
+            "OpenAIRealtimeVoiceSource: model/voice/instructions are ignored -- they are fixed when the ek_ is minted.")
+        self.init(credential: .value(credential))
+    }
+
+    /// A fresh `ek_` for this (re)connect; anything else is refused (fatal).
+    private func resolveKey() async throws -> String {
+        let ek: String
+        do {
+            ek = try await credentials.resolve(vendor: "OpenAIRealtimeVoiceSource").credential
+        } catch CredentialError.fatal(let m) where m.hasSuffix("a credential is required") {
+            throw OpenAIRealtimeError.missingCredential
+        }
+        try InsecureCredential.check(
+            vendor: "OpenAIRealtimeVoiceSource", isEphemeral: InsecureCredential.isOpenAIEphemeral(ek),
+            ephemeralShape: InsecureCredential.openAIShape)
+        if !credentials.canRefresh {
+            let spent = await MainActor.run { () -> Bool in
+                defer { pastedUsed = true }
+                return pastedUsed
             }
-            // Runs inside the provider, i.e. at connect time and on every
-            // reconnect -- before the permission prompt and before the mic.
-            try InsecureCredential.check(
-                vendor: "OpenAIRealtimeVoiceSource",
-                isEphemeral: false,
-                allowInsecureApiKey: allowInsecureApiKey,
-                ephemeralShape: InsecureCredential.openAIShape,
-                mintHint: InsecureCredential.openAIMintHint)
-            let req = OpenAIRealtimeSignaling.clientSecretRequest(
-                apiKey: c, model: model, voice: voice, instructions: instructions)
-            let (status, body) = try await OpenAIRealtimeSignaling.send(req)
-            return try OpenAIRealtimeSignaling.clientSecret(status: status, body: body)
-        })
+            if spent { throw OpenAIRealtimeError.credentialSpent }
+        }
+        return ek
     }
 
     public func onMetrics(_ cb: @escaping (VoiceMetrics) -> Void) { metricsCb = cb }
     public func onStateChange(_ cb: @escaping (AgentState) -> Void) { session.onState = cb }
     public func onInterrupt(_ cb: @escaping () -> Void) { session.onInterrupt = cb }
+    public func onConnectionChange(_ cb: @escaping (Bool) -> Void) { connectionCb = cb }
+    public var reportsConnection: Bool { true }
+    public var supportsMute: Bool { true }
+
+    /// Muted, the mic track is disabled: WebRTC sends silence and the call stays up. Each
+    /// reconnect's new track starts muted too.
+    public func setMuted(_ muted: Bool) {
+        let apply = { [self] in
+            self.muted = muted
+            micTrack?.isEnabled = !muted
+        }
+        if Thread.isMainThread { apply() } else { DispatchQueue.main.async(execute: apply) }
+    }
+
+    private func setSessionUp(_ up: Bool) {
+        guard up != sessionUp else { return }
+        sessionUp = up
+        connectionCb?(up)
+    }
 
     public func connect() async throws {
         await MainActor.run {
@@ -113,12 +155,13 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
             session.connecting()
         }
         do {
-            let ek = try await credentialProvider()  // auth first: no prompt for a bad credential
+            let ek = try await resolveKey()  // auth first: no prompt for a bad credential
             guard await requestPermission() else { throw VoiceSourceError.permissionDenied }
             try await call(ek)
             await MainActor.run {
                 session.connected()
                 startTimer()
+                setSessionUp(true)
             }
         } catch {
             await MainActor.run { disconnect() }
@@ -144,6 +187,8 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
             }
             self.pc = pc
             let mic = f.audioTrack(with: f.audioSource(with: constraints), trackId: "mic")
+            mic.isEnabled = !muted
+            micTrack = mic
             pc.add(mic, streamIds: ["mic"])
             let dc = pc.dataChannel(forLabel: "oai-events", configuration: LKRTCDataChannelConfiguration())
             dc?.delegate = self
@@ -188,6 +233,7 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
         channel?.delegate = nil
         channel?.close()
         channel = nil
+        micTrack = nil
         pc?.close()
         pc = nil
     }
@@ -210,7 +256,7 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
                 guard await MainActor.run(body: { wantConnected }) else { break }
                 try? await Task.sleep(nanoseconds: UInt64(RealtimeReconnect.delayMs(attempt: attempt)) * 1_000_000)
                 do {
-                    try await call(try await credentialProvider())
+                    try await call(try await resolveKey())
                     await MainActor.run {
                         reconnecting = false
                         session.connected()
@@ -219,6 +265,8 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
                 } catch let e as OpenAIRealtimeSignaling.SignalingError {
                     if case .fatal = e { break attempts }
                 } catch let e as OpenAIRealtimeError where e == .credentialSpent || e == .missingCredential {
+                    break attempts
+                } catch let e as CredentialError where e.isFatal {
                     break attempts
                 } catch {
                     NSLog(
@@ -260,6 +308,7 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
         closeCall()
         factory = nil
         session.stopped()
+        setSessionUp(false)
     }
 
     /// WebRTC audio thread: copy the model's PCM into the tap.
@@ -334,7 +383,7 @@ extension OpenAIRealtimeVoiceSource: LKRTCPeerConnectionDelegate, LKRTCDataChann
 
 public enum OpenAIRealtimeError: Error, Equatable {
     case missingCredential
-    /// A pasted `ek_` is single-session; reconnecting needs a `credentialProvider`.
+    /// A pasted `ek_` is single-session; reconnecting needs `credentialUrl` or a provider.
     case credentialSpent
     case peerConnection
     case channelClosed

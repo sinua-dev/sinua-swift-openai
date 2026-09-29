@@ -11,22 +11,25 @@ dependency on this one.
 import Sinua
 import SinuaOpenAI
 
-// Production: your backend mints a fresh `ek_` per connect.
-let voice = OpenAIRealtimeVoiceSource(credentialProvider: { try await myBackend.realtimeKey() })
+// Production: your backend answers { credential: "ek_…", expiresAt } -- a fresh one per connect.
+let voice = OpenAIRealtimeVoiceSource(credentialUrl: URL(string: "https://your.app/api/voice/openai")!)
 SinuaView(pattern: "breathing", size: 64, voice: voice)
 ```
 
 ## Credentials
 
-Realtime uses WebRTC from clients and short-lived **ephemeral keys**
-(`ek_…`), minted server-side by `POST /v1/realtime/client_secrets` with your
-secret key. `credentialProvider` is called on every connect *and every
-reconnect*, which is what a single-use key needs.
+Realtime uses WebRTC from clients and short-lived **ephemeral keys** (`ek_…`),
+minted server-side by `POST /v1/realtime/client_secrets` with your secret key --
+`mintOpenAIRealtimeCredential` in `@sinua/voice/server` does it, and
+`npx @sinua/voice dev-proxy` serves one locally. The source takes the shared
+contract (`CredentialSource`): `credentialUrl:` (your endpoint, answering
+`{ credential, expiresAt? }`), `credential: .provider { … }`, or one pasted `ek_`.
+A URL or provider is asked on every connect *and every reconnect*, which is what
+a single-use key needs. The session's model, voice and instructions are fixed
+where the `ek_` is minted.
 
-A raw, long-lived API key is **refused** unless you pass
-`allowInsecureApiKey: true`, and then it warns once per connect. That path
-exists for a local demo with a developer's own key — it mints the `ek_` on the
-device, which means the account key is on the device. Never ship it.
+A raw, long-lived API key is always **refused** before the mic prompt; there is
+no opt-in.
 
 ## Why LiveKit's WebRTC build
 
@@ -38,7 +41,7 @@ the same app, it tracks current milestones, and an app using both this and
 ## Adding it
 
 ```swift
-.package(path: "../sinua/packages/ios-openai")   // once published: .package(url: "https://github.com/sinua-dev/sinua-swift-openai", from: "0.1.0-beta.5")
+.package(path: "../sinua/packages/ios-openai")   // once published: .package(url: "https://github.com/sinua-dev/sinua-swift-openai", from: "0.1.0-beta.6")
 ```
 
 It depends on `packages/ios` by path, so both must be present.
