@@ -39,6 +39,7 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
     /// A pasted `ek_` is single-session: set once it has been used.
     private var pastedUsed = false
     private let callsURL: URL
+    private let warp: Bool
     private let urlSession: URLSession
     private let requestPermission: () async -> Bool
     private let session = OpenAIRealtimeSession()
@@ -62,14 +63,22 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
 
     /// The designated init: `credential` is `.url(…)` / `.provider { … }` (a fresh `ek_`
     /// from your backend on every connect and reconnect), or `.value("ek_…")` for one session.
+    ///
+    /// `warp`: WARP (developers.openai.com `guides/realtime-webrtc-warp`) -- libwebrtc's
+    /// DTLS 1.3 / SNAP / SPED field trials plus a pre-negotiated event channel whose id goes
+    /// along as `dcid`, for fewer round trips at startup. Field trials are process-wide and
+    /// only take effect before the app's first peer connection factory (if LiveKit made one
+    /// first, only the negotiated channel applies). A `callsURL` backend must forward `dcid`.
     public init(
         credential: CredentialSource,
         callsURL: URL = OpenAIRealtimeSignaling.callsURL,
+        warp: Bool = false,
         urlSession: URLSession = .shared,
         requestPermission: @escaping () async -> Bool = AVPcmAudioDevice.requestPermission
     ) {
         credentials = credential
         self.callsURL = callsURL
+        self.warp = warp
         self.urlSession = urlSession
         self.requestPermission = requestPermission
     }
@@ -83,12 +92,13 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
     public convenience init(
         credentialProvider: @escaping @Sendable () async throws -> String,
         callsURL: URL = OpenAIRealtimeSignaling.callsURL,
+        warp: Bool = false,
         urlSession: URLSession = .shared,
         requestPermission: @escaping () async -> Bool = AVPcmAudioDevice.requestPermission
     ) {
         self.init(
             credential: .provider { SinuaCredential(credential: try await credentialProvider()) },
-            callsURL: callsURL, urlSession: urlSession, requestPermission: requestPermission)
+            callsURL: callsURL, warp: warp, urlSession: urlSession, requestPermission: requestPermission)
     }
 
     /// One pasted `ek_…` (single session: a drop without a provider ends in `idle`).
@@ -113,9 +123,8 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
         } catch CredentialError.fatal(let m) where m.hasSuffix("a credential is required") {
             throw OpenAIRealtimeError.missingCredential
         }
-        try InsecureCredential.check(
-            vendor: "OpenAIRealtimeVoiceSource", isEphemeral: InsecureCredential.isOpenAIEphemeral(ek),
-            ephemeralShape: InsecureCredential.openAIShape)
+        // `ek_` on OpenAI's host; your own token (never `sk-…`) on your own calls endpoint.
+        try InsecureCredential.checkOpenAI(credential: ek, callsURL: callsURL)
         if !credentials.canRefresh {
             let spent = await MainActor.run { () -> Bool in
                 defer { pastedUsed = true }
@@ -177,6 +186,7 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
 
     private func call(_ ek: String) async throws {
         let (pc, constraints) = try await MainActor.run { () throws -> (LKRTCPeerConnection, LKRTCMediaConstraints) in
+            if warp, factory == nil { WarpFieldTrials.enable() }
             let f = factory ?? LKRTCPeerConnectionFactory()
             factory = f
             let config = LKRTCConfiguration()
@@ -190,7 +200,12 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
             mic.isEnabled = !muted
             micTrack = mic
             pc.add(mic, streamIds: ["mic"])
-            let dc = pc.dataChannel(forLabel: "oai-events", configuration: LKRTCDataChannelConfiguration())
+            let dcConfig = LKRTCDataChannelConfiguration()
+            if warp {
+                dcConfig.isNegotiated = true
+                dcConfig.channelId = OpenAIRealtimeSignaling.warpDataChannelId
+            }
+            let dc = pc.dataChannel(forLabel: "oai-events", configuration: dcConfig)
             dc?.delegate = self
             channel = dc
             return (pc, constraints)
@@ -199,7 +214,9 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
         let offer = try await pc.offer(for: constraints)
         try await pc.setLocalDescription(offer)
         let (status, body) = try await OpenAIRealtimeSignaling.send(
-            OpenAIRealtimeSignaling.callsRequest(sdpOffer: offer.sdp, ephemeralKey: ek, url: callsURL),
+            OpenAIRealtimeSignaling.callsRequest(
+                sdpOffer: offer.sdp, ephemeralKey: ek, url: callsURL,
+                dcid: warp ? OpenAIRealtimeSignaling.warpDataChannelId : nil),
             session: urlSession)
         let answer = try OpenAIRealtimeSignaling.answer(status: status, body: body)
         guard await MainActor.run(body: { self.pc === pc }) else { throw CancellationError() }
