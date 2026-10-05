@@ -42,6 +42,9 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
     private let warp: Bool
     private let urlSession: URLSession
     private let requestPermission: () async -> Bool
+    private let audioSession: VoiceAudioSession
+    /// This source claimed the app's audio session (released on teardown). Main thread.
+    private var holdsSession = false
     private let session = OpenAIRealtimeSession()
     private let tap = PcmTap()
     private lazy var renderer = Renderer(sink: tap.sink)
@@ -69,13 +72,17 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
     /// along as `dcid`, for fewer round trips at startup. Field trials are process-wide and
     /// only take effect before the app's first peer connection factory (if LiveKit made one
     /// first, only the negotiated channel applies). A `callsURL` backend must forward `dcid`.
+    /// `audioSession`: how the app's audio session is set up before the call (default: the
+    /// loudspeaker; `.unmanaged` if your app does it).
     public init(
         credential: CredentialSource,
         callsURL: URL = OpenAIRealtimeSignaling.callsURL,
         warp: Bool = false,
         urlSession: URLSession = .shared,
-        requestPermission: @escaping () async -> Bool = AVPcmAudioDevice.requestPermission
+        requestPermission: @escaping () async -> Bool = AVPcmAudioDevice.requestPermission,
+        audioSession: VoiceAudioSession = .speaker
     ) {
+        self.audioSession = audioSession
         credentials = credential
         self.callsURL = callsURL
         self.warp = warp
@@ -94,11 +101,13 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
         callsURL: URL = OpenAIRealtimeSignaling.callsURL,
         warp: Bool = false,
         urlSession: URLSession = .shared,
-        requestPermission: @escaping () async -> Bool = AVPcmAudioDevice.requestPermission
+        requestPermission: @escaping () async -> Bool = AVPcmAudioDevice.requestPermission,
+        audioSession: VoiceAudioSession = .speaker
     ) {
         self.init(
             credential: .provider { SinuaCredential(credential: try await credentialProvider()) },
-            callsURL: callsURL, warp: warp, urlSession: urlSession, requestPermission: requestPermission)
+            callsURL: callsURL, warp: warp, urlSession: urlSession, requestPermission: requestPermission,
+            audioSession: audioSession)
     }
 
     /// One pasted `ek_…` (single session: a drop without a provider ends in `idle`).
@@ -166,6 +175,7 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
         do {
             let ek = try await resolveKey()  // auth first: no prompt for a bad credential
             guard await requestPermission() else { throw VoiceSourceError.permissionDenied }
+            try await MainActor.run { try claimSession() }
             try await call(ek)
             await MainActor.run {
                 session.connected()
@@ -316,7 +326,17 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
         session.tick(level: m.level)
     }
 
+    /// The app's audio session, set up before the peer connection's audio engine starts.
+    private func claimSession() throws {
+        guard !holdsSession else { return }
+        holdsSession = try WebRTCAudioSession.claim(audioSession)
+    }
+
     private func teardown() {
+        if holdsSession {
+            holdsSession = false
+            WebRTCAudioSession.release()
+        }
         wantConnected = false
         timer?.cancel()
         timer = nil
