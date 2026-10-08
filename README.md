@@ -41,7 +41,7 @@ the same app, it tracks current milestones, and an app using both this and
 ## Adding it
 
 ```swift
-.package(path: "../sinua/packages/ios-openai")   // once published: .package(url: "https://github.com/sinua-dev/sinua-swift-openai", from: "0.1.0-beta.8")
+.package(path: "../sinua/packages/ios-openai")   // once published: .package(url: "https://github.com/sinua-dev/sinua-swift-openai", from: "0.1.0-beta.9")
 ```
 
 It depends on `packages/ios` by path, so both must be present.

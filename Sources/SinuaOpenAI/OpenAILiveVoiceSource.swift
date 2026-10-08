@@ -45,7 +45,7 @@ public final class OpenAILiveVoiceSource: NSObject, VoiceSource, @unchecked Send
     private let audioSession: VoiceAudioSession
     /// This source claimed the app's audio session (released on teardown). Main thread.
     private var holdsSession = false
-    private let session = OpenAILiveSession()
+    private let session: OpenAILiveSession
     private let tap = PcmTap()
     private lazy var renderer = Renderer(sink: tap.sink)
 
@@ -72,7 +72,8 @@ public final class OpenAILiveVoiceSource: NSObject, VoiceSource, @unchecked Send
     /// `credential`: your own token for it, fresh per session with `.url(…)` / `.provider { … }`;
     /// nil when your endpoint authenticates another way. `audioSession`: how the app's audio
     /// session is set up before the call (default: the loudspeaker; `.unmanaged` if your app
-    /// does it).
+    /// does it). `syncToAudio`: transcripts reveal the assistant's text with the played audio
+    /// (default), or pass GPT-Live's text through as it arrives (`false`).
     public init(
         sessionURL: URL,
         credential: CredentialSource? = nil,
@@ -80,8 +81,10 @@ public final class OpenAILiveVoiceSource: NSObject, VoiceSource, @unchecked Send
         reconnect: Bool = true,
         urlSession: URLSession = .shared,
         requestPermission: @escaping () async -> Bool = AVPcmAudioDevice.requestPermission,
-        audioSession: VoiceAudioSession = .speaker
+        audioSession: VoiceAudioSession = .speaker,
+        syncToAudio: Bool = true
     ) {
+        session = OpenAILiveSession(syncToAudio: syncToAudio)
         self.audioSession = audioSession
         self.sessionURL = sessionURL
         credentials = credential
@@ -99,6 +102,12 @@ public final class OpenAILiveVoiceSource: NSObject, VoiceSource, @unchecked Send
     public func onMetrics(_ cb: @escaping (VoiceMetrics) -> Void) { metricsCb = cb }
     public func onStateChange(_ cb: @escaping (AgentState) -> Void) { session.onState = cb }
     public func onInterrupt(_ cb: @escaping () -> Void) { session.onInterrupt = cb }
+    /// Both speakers' live transcript, on the main actor (design note 39). `syncToAudio`
+    /// (init) reveals the assistant's text with the played audio, else passes GPT-Live's text
+    /// through as it arrives. Turn ids keep counting across reconnects; nothing is kept or sent.
+    public func onTranscript(_ cb: @escaping (TranscriptUpdate) -> Void) { session.onTranscript = cb }
+    public var supportsTranscript: Bool { true }
+    public var transcriptTiming: TranscriptTiming { .segments }
     public func onConnectionChange(_ cb: @escaping (Bool) -> Void) { connectionCb = cb }
     public var reportsConnection: Bool { true }
     public var supportsMute: Bool { true }
