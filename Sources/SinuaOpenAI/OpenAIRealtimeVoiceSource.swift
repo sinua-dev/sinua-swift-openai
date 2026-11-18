@@ -156,14 +156,22 @@ public final class OpenAIRealtimeVoiceSource: NSObject, VoiceSource, @unchecked 
     }
 
     public func onMetrics(_ cb: @escaping (VoiceMetrics) -> Void) { metricsCb = cb }
-    public func onStateChange(_ cb: @escaping (AgentState) -> Void) { session.onState = cb }
+    /// Mid-session, it replays the current state at once: a view mounted after `connect()` doesn't stay idle.
+    public func onStateChange(_ cb: @escaping (AgentState) -> Void) {
+        session.onState = cb
+        if session.state != .idle { cb(session.state) }
+    }
     public func onInterrupt(_ cb: @escaping () -> Void) { session.onInterrupt = cb }
     /// Both speakers' live transcript (design note 39); display only, nothing is kept or sent.
     /// The user's side needs input transcription (`transcribeUser`).
     public func onTranscript(_ cb: @escaping (TranscriptUpdate) -> Void) { session.onTranscript = cb }
     public var supportsTranscript: Bool { true }
     public var transcriptTiming: TranscriptTiming { .none }
-    public func onConnectionChange(_ cb: @escaping (Bool) -> Void) { connectionCb = cb }
+    /// While the session is up, it replays `true` at once, in any state.
+    public func onConnectionChange(_ cb: @escaping (Bool) -> Void) {
+        connectionCb = cb
+        if sessionUp { cb(true) }
+    }
     public var reportsConnection: Bool { true }
     public var supportsMute: Bool { true }
 
